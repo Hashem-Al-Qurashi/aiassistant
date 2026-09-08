@@ -22,6 +22,14 @@ from enum import Enum as PyEnum
 from backend.core.base import Base
 from backend.database import TESTING
 
+if not TESTING:
+    from pgvector.sqlalchemy import Vector
+
+if not TESTING:
+    from pgvector.sqlalchemy import Vector
+else:
+    Vector = None
+
 
 class Organization(Base):
     """Organization entity - top-level tenant."""
