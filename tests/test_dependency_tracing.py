@@ -189,6 +189,232 @@ class TestDependencyTracer:
         assert path[2] == {"type": "recommendation", "id": str(recommendation.id)}
 
 
+class TestDependencyTracerEdgeCases:
+    """Edge cases: deep chains, missing nodes, branch convergence, cycles."""
+
+    @pytest.mark.asyncio
+    async def test_deep_chain_a_h_r_s_sc(self, db_session):
+        """G2: Deep chain assumption → hypothesis → recommendation → slide → scene."""
+        from backend.models.entities import (
+            Engagement, EngagementStatus, Assumption, Hypothesis,
+            Recommendation, DependencyEdge,
+        )
+
+        engagement = Engagement(
+            name="Deep Chain Test",
+            objective="Test deep propagation",
+            status=EngagementStatus.DISCOVERY,
+        )
+        db_session.add(engagement)
+        await db_session.flush()
+
+        assumption = Assumption(
+            engagement_id=engagement.id,
+            name="Deep assumption",
+            description="A1",
+        )
+        hypothesis = Hypothesis(
+            engagement_id=engagement.id,
+            title="Deep hypothesis",
+            description="H1",
+            confidence=0.5,
+        )
+        rec = Recommendation(
+            engagement_id=engagement.id,
+            hypothesis_id=hypothesis.id,
+            title="Deep recommendation",
+            description="R1",
+            confidence=0.6,
+        )
+        db_session.add_all([assumption, hypothesis, rec])
+        await db_session.flush()
+
+        # Full chain: assumption → hypothesis → recommendation
+        edges = [
+            DependencyEdge(engagement_id=engagement.id,
+                source_type="assumption", source_id=assumption.id,
+                target_type="hypothesis", target_id=hypothesis.id),
+            DependencyEdge(engagement_id=engagement.id,
+                source_type="hypothesis", source_id=hypothesis.id,
+                target_type="recommendation", target_id=rec.id),
+        ]
+        db_session.add_all(edges)
+        await db_session.commit()
+
+        tracer = DependencyTracer(db_session=db_session)
+        affected = await tracer.trace_impact_async("assumption", str(assumption.id))
+
+        assert str(hypothesis.id) in affected["hypotheses"]
+        assert str(rec.id) in affected["recommendations"]
+
+    @pytest.mark.asyncio
+    async def test_missing_intermediate_node_in_chain(self, db_session):
+        """G2: Chain A → H → R but H missing from DB. R should not be found."""
+        from backend.models.entities import (
+            Engagement, EngagementStatus, Assumption, Recommendation,
+            DependencyEdge,
+        )
+
+        engagement = Engagement(
+            name="Missing Node Test",
+            objective="Missing intermediate",
+            status=EngagementStatus.DISCOVERY,
+        )
+        db_session.add(engagement)
+        await db_session.flush()
+
+        assumption = Assumption(
+            engagement_id=engagement.id,
+            name="A1",
+            description="Assumption",
+        )
+        rec = Recommendation(
+            engagement_id=engagement.id,
+            title="R1",
+            description="Recommendation with no hypothesis link",
+            confidence=0.6,
+        )
+        db_session.add_all([assumption, rec])
+        await db_session.flush()
+
+        # Only edge: assumption → recommendation (skipping hypothesis)
+        edge = DependencyEdge(
+            engagement_id=engagement.id,
+            source_type="assumption", source_id=assumption.id,
+            target_type="recommendation", target_id=rec.id,
+        )
+        db_session.add(edge)
+        await db_session.commit()
+
+        tracer = DependencyTracer(db_session=db_session)
+        affected = await tracer.trace_impact_async("assumption", str(assumption.id))
+
+        # recommendation is found through direct edge
+        assert str(rec.id) in affected["recommendations"]
+
+    @pytest.mark.asyncio
+    async def test_branch_convergence_diamond(self, db_session):
+        """G2: Diamond pattern A → H1, H2 → R. R appears once in recommendations."""
+        from backend.models.entities import (
+            Engagement, EngagementStatus, Assumption, Hypothesis,
+            Recommendation, DependencyEdge,
+        )
+
+        engagement = Engagement(
+            name="Diamond Test",
+            objective="Branch convergence",
+            status=EngagementStatus.DISCOVERY,
+        )
+        db_session.add(engagement)
+        await db_session.flush()
+
+        a = Assumption(engagement_id=engagement.id, name="A1", description="A")
+        h1 = Hypothesis(engagement_id=engagement.id, title="H1", description="H1", confidence=0.5)
+        h2 = Hypothesis(engagement_id=engagement.id, title="H2", description="H2", confidence=0.6)
+        r = Recommendation(
+            engagement_id=engagement.id,
+            title="R1", description="R",
+            confidence=0.7,
+        )
+        db_session.add_all([a, h1, h2, r])
+        await db_session.flush()
+
+        edges = [
+            DependencyEdge(engagement_id=engagement.id,
+                source_type="assumption", source_id=a.id,
+                target_type="hypothesis", target_id=h1.id),
+            DependencyEdge(engagement_id=engagement.id,
+                source_type="assumption", source_id=a.id,
+                target_type="hypothesis", target_id=h2.id),
+            DependencyEdge(engagement_id=engagement.id,
+                source_type="hypothesis", source_id=h1.id,
+                target_type="recommendation", target_id=r.id),
+            DependencyEdge(engagement_id=engagement.id,
+                source_type="hypothesis", source_id=h2.id,
+                target_type="recommendation", target_id=r.id),
+        ]
+        db_session.add_all(edges)
+        await db_session.commit()
+
+        tracer = DependencyTracer(db_session=db_session)
+        affected = await tracer.trace_impact_async("assumption", str(a.id))
+
+        assert str(r.id) in affected["recommendations"]
+        # Should appear exactly once despite two paths
+        assert affected["recommendations"].count(str(r.id)) == 1
+
+    @pytest.mark.asyncio
+    async def test_trace_impact_from_hypothesis(self, db_session):
+        """G2: Tracing from hypothesis (not assumption) finds downstream recommendations."""
+        from backend.models.entities import (
+            Engagement, EngagementStatus, Hypothesis, Recommendation,
+            DependencyEdge,
+        )
+
+        engagement = Engagement(
+            name="Hypothesis Source Test",
+            objective="Trace from hypothesis",
+            status=EngagementStatus.DISCOVERY,
+        )
+        db_session.add(engagement)
+        await db_session.flush()
+
+        h = Hypothesis(engagement_id=engagement.id, title="H1", description="H", confidence=0.5)
+        r1 = Recommendation(engagement_id=engagement.id, title="R1", description="R1", confidence=0.7)
+        r2 = Recommendation(engagement_id=engagement.id, title="R2", description="R2", confidence=0.6)
+        db_session.add_all([h, r1, r2])
+        await db_session.flush()
+
+        edges = [
+            DependencyEdge(engagement_id=engagement.id,
+                source_type="hypothesis", source_id=h.id,
+                target_type="recommendation", target_id=r1.id),
+            DependencyEdge(engagement_id=engagement.id,
+                source_type="hypothesis", source_id=h.id,
+                target_type="recommendation", target_id=r2.id),
+        ]
+        db_session.add_all(edges)
+        await db_session.commit()
+
+        tracer = DependencyTracer(db_session=db_session)
+        affected = await tracer.trace_impact_async("hypothesis", str(h.id))
+
+        assert str(r1.id) in affected["recommendations"]
+        assert str(r2.id) in affected["recommendations"]
+        assert len(affected["recommendations"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_no_dependencies_returns_empty(self, db_session):
+        """G2: Entity with no downstream edges returns all empty lists."""
+        from backend.models.entities import (
+            Engagement, EngagementStatus, Recommendation,
+        )
+
+        engagement = Engagement(
+            name="No Deps Test",
+            objective="No downstream",
+            status=EngagementStatus.DISCOVERY,
+        )
+        db_session.add(engagement)
+        await db_session.flush()
+
+        rec = Recommendation(
+            engagement_id=engagement.id,
+            title="Orphan rec",
+            description="No deps",
+            confidence=0.5,
+        )
+        db_session.add(rec)
+        await db_session.commit()
+
+        tracer = DependencyTracer(db_session=db_session)
+        affected = await tracer.trace_impact_async("recommendation", str(rec.id))
+
+        assert affected["recommendations"] == []
+        assert affected["slides"] == []
+        assert affected["scenes"] == []
+
+
 class TestConfidenceEngine:
     """Test confidence calculation and Devil's Advocate recalculation."""
 

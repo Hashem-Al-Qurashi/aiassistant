@@ -145,7 +145,6 @@ class DependencyTracer:
         """
         if not self.db:
             return []
-            return []
 
         visited = set()
         queue: list[tuple[str, str, list[dict[str, str]]]] = [
